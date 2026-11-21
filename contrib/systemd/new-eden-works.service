@@ -1,0 +1,21 @@
+# New Eden Works service: every enabled plugin's scheduled jobs in one process (see README, `service`).
+# It replaces eve-orders-alert.timer and eve-prices.timer, and eve-dashboard.service once config.json has
+# "service": {"jobs": {"dashboard": true}} and a "dashboard" section. Install:
+#   cp contrib/systemd/new-eden-works.service ~/.config/systemd/user/
+#   edit the two /path/to/eve-tools paths below (or print a filled-in unit: neworks service unit)
+#   systemctl --user daemon-reload && systemctl --user enable --now new-eden-works.service
+# It runs the code of the checkout it points at: restart it after pulling or switching branches.
+[Unit]
+Description=New Eden Works: scheduled jobs (alerts, price sync) and the dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/eve-tools
+ExecStart=/path/to/eve-tools/.venv/bin/python -m newedenworks service
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target

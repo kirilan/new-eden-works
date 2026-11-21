@@ -1,0 +1,32 @@
+# Keeps the maintainer's private terms (character, corporation and place names of a real operation)
+# out of the repository. The terms live in the PRIVATE_TERMS secret, never in the code; a pull request
+# from a fork gets no secrets, so there the check says it was skipped (the maintainer's own run after
+# merging still checks). Only where a term matched is printed, never the term.
+name: private terms
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terms:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0     # the commit messages after the base are checked too
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Check the tree and the new commit messages
+        env:
+          PRIVATE_TERMS: ${{ secrets.PRIVATE_TERMS }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python .github/scripts/check_terms.py

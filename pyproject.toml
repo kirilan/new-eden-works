@@ -1,0 +1,73 @@
+[build-system]
+# SPDX license expressions and `license-files` need setuptools >= 77 (PEP 639).
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "new-eden-works"
+description = "New Eden Works: an EVE Online toolkit and agent harness - characters, industry, planetary industry, an accounting ledger and a dashboard, as plugins, with an MCP server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+# PEP 639: the SPDX expression above replaces the old `License ::` trove classifiers,
+# and setuptools refuses both at once - keep this list free of License entries.
+license-files = ["LICENSE"]
+dynamic = ["version"]
+# GitHub's noreply address: the package is published, the maintainer's mailbox is not.
+authors = [{ name = "kirilan", email = "kirilan@users.noreply.github.com" }]
+keywords = [
+    "eve-online",
+    "esi",
+    "sde",
+    "cli",
+    "industry",
+    "planetary-industry",
+    "skill-queue",
+    "accounting",
+    "mcp",
+    "agent-skills",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    # Pure stdlib; storage and paths branch by capability, so both families are honest claims.
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Games/Entertainment :: Role-Playing",
+    "Topic :: Utilities",
+]
+# Runtime is standard library only; adding a dependency here is a deliberate decision.
+dependencies = []
+
+# Tooling for cutting a release (see RELEASE.md). Never required at runtime, and never
+# imported by newedenworks itself.
+[project.optional-dependencies]
+release = ["build>=1.2", "twine>=5"]
+
+[project.scripts]
+# New Eden Works: `neworks` is the short command, `new-eden-works` the full one (scripts, units, MCP
+# configs).
+neworks = "newedenworks.cli:main"
+new-eden-works = "newedenworks.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kirilan/new-eden-works"
+Repository = "https://github.com/kirilan/new-eden-works"
+Issues = "https://github.com/kirilan/new-eden-works/issues"
+
+[tool.setuptools.packages.find]
+include = ["newedenworks*"]
+
+[tool.setuptools.package-data]
+# The SDE snapshot the CLI falls back to when $XDG_DATA_HOME has nothing newer.
+newedenworks = ["data/*.json", "data/*.html", "skills/*/*.md", "industry/skills/*/*.md"]
+
+[tool.setuptools.dynamic]
+# Single source of truth: `neworks --version` and the shipped metadata cannot drift.
+version = { attr = "newedenworks.__version__" }

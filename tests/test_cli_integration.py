@@ -1,0 +1,1354 @@
+"""Command-level integration: the real cli/exports handlers driven end-to-end against
+the fake ESI transport and a temporary XDG tree (see tests/fake_esi.py).
+
+Protects the seams unit tests cannot reach: token isolation between stored characters,
+current live response shapes (standings as a bare list, asset rows with `type_id`),
+machine-readable output contracts, and graceful degradation when one character fails
+or never consented to a scope. No network, no real config, no secrets."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from newedenworks import cli, divisions, sso
+
+from tests.fake_esi import (
+    ADA, CORP_SHARED, JOB_STRUCTURE, MARKET_BROKEN, MIRA, VELA, INV_CONTAINER_ITEM,
+    INV_CITADEL_BLIND, INV_SHIP_ITEM, SKILL_CAPPED, SKILL_NAV, SKILL_OMEGA_ONLY,
+    SKILL_UNSTARTED, SKILL_WIDE, BUILD_CELL, BUILD_HOUSING, BUILD_PASTE, BUILD_PLATE,
+    STATION_JITA, FakeEsiEnv, http_date, industry_jobs, iso,
+)
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class CommandTestCase(unittest.TestCase):
+    def setUp(self):
+        self.env = FakeEsiEnv()
+        self.env.start()
+        self.env.install_core()
+        self.addCleanup(self.env.stop)
+
+    def fail_character(self, char, status=403, error="consent revoked"):
+        """Make every skills fetch for `char` fail the way live ESI does."""
+        self.env.server.get(f"/characters/{char.character_id}/skills", error=(status, {"error": error}))
+
+
+class SkillsCommandTests(CommandTestCase):
+    def test_single_character_text_view_reports_state_queue_and_pending_completion(self):
+        code, out, err = self.env.run(["skills", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Ada Vane (id 91000001)", out)
+        self.assertIn("Caldari", out)
+        self.assertIn("clone grade: Caldari Alpha Clone", out)
+        self.assertIn("Clone state: OMEGA", out)
+        self.assertIn("TRAINING QUEUE (2)", out)
+        # finished-but-unlogged queue item shows as pending, not lost
+        self.assertIn("* completed training, not yet reflected by ESI", out)
+        self.assertNotIn("Vela", out)  # --char isolates the other stored character
+
+    def test_json_output_is_machine_readable_and_keeps_untrained_rows(self):
+        code, out, _ = self.env.run(["skills", "--char", "Ada", "--json"])
+        self.assertEqual(code, 0)
+        doc = json.loads(out)  # a single document, not a list
+        self.assertEqual(doc["character"]["id"], ADA.character_id)
+        self.assertEqual(doc["character"]["name"], "Ada Vane")
+        self.assertEqual(doc["character"]["race"], "Caldari")
+        self.assertEqual(doc["clone_state"]["state"], "OMEGA")
+        self.assertEqual(doc["totals"], {"total_sp": 6000000, "unallocated_sp": 120000})
+        self.assertEqual([q["status"] for q in doc["queue"]], ["done", "training"])
+        self.assertEqual([q["name"] for q in doc["queue"]], ["Wide Skill", "Navigation"])
+        rows = {r["skill_id"]: r for r in doc["skills"]}
+        self.assertTrue(rows[SKILL_WIDE]["pending_completion"])
+        self.assertEqual(rows[SKILL_WIDE]["trained_level"], 5)      # queue completion applied
+        self.assertFalse(rows[SKILL_NAV]["pending_completion"])
+        self.assertIsNone(rows[SKILL_OMEGA_ONLY]["alpha_cap"])
+        self.assertEqual(rows[SKILL_OMEGA_ONLY]["access"], "omega")
+        self.assertEqual(rows[SKILL_UNSTARTED]["trained_level"], 0)  # L0 rows live only in --json
+
+    def test_csv_covers_every_stored_character_and_skips_zero_rows(self):
+        code, out, _ = self.env.run(["skills", "--csv"])
+        self.assertEqual(code, 0)
+        rows = list(csv.DictReader(out.splitlines()))
+        by_char = {(r["character_id"], r["skill_id"]) for r in rows}
+        self.assertEqual(by_char, {
+            ("91000001", "1003"), ("91000001", "1005"), ("91000001", "2000"),
+            ("91000001", "1011"), ("91000002", "1003"), ("91000002", "1005"),
+        })  # the never-trained prerequisite is excluded, exactly like the table view
+        self.assertNotIn("0", {r["trained_level"] for r in rows})
+        vela = next(r for r in rows if (r["character_id"], r["skill_id"]) == ("91000002", "1003"))
+        self.assertEqual(vela["character_name"], "Vela Krinn")  # rows stay attributed correctly
+        self.assertEqual(vela["restricted"], "1")               # live clamp survives serialization
+        ada_wide = next(r for r in rows if (r["character_id"], r["skill_id"]) == ("91000001", "1005"))
+        self.assertEqual(ada_wide["pending_completion"], "1")
+
+    def test_two_characters_render_separate_blocks_in_name_order(self):
+        code, out, err = self.env.run(["skills"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("=" * 72, out)
+        self.assertIn("Clone state: OMEGA", out)   # Ada
+        self.assertIn("Clone state: ALPHA", out)   # Vela's live clamp
+        self.assertLess(out.index("Ada Vane"), out.index("Vela Krinn"))
+
+    def test_one_failing_character_degrades_to_a_warning(self):
+        self.fail_character(VELA)
+        code, out, err = self.env.run(["skills"])
+        self.assertEqual(code, 0)  # partial data is still a usable run
+        self.assertIn("warning: skipped Vela Krinn: HTTP 403: consent revoked", err)
+        self.assertIn("Ada Vane", out)
+        self.assertNotIn("ALPHA", out)  # the failed character contributes no rows
+
+    def test_all_characters_failing_is_a_failing_exit(self):
+        self.fail_character(ADA, status=500, error="esi down")
+        self.fail_character(VELA, status=500, error="esi down")
+        code, _, err = self.env.run(["skills"])
+        self.assertEqual(code, 1)
+        self.assertIn("no character data could be fetched", err)
+
+
+class SummaryCommandTests(CommandTestCase):
+    def test_totals_and_states_across_characters(self):
+        code, out, err = self.env.run(["summary"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Ada Vane", out)
+        self.assertIn("Vela Krinn", out)
+        self.assertIn("OMEGA (high)", out)
+        self.assertIn("ALPHA (high)", out)
+        self.assertIn("6.90M", out)    # 6.0M + 0.9M total SP
+        self.assertIn("2h 30m", out)   # Ada's active item, from ESI-relative dates
+        self.assertIn("2 characters", out)
+
+    def test_summary_survives_one_failed_character(self):
+        self.fail_character(VELA)
+        code, out, err = self.env.run(["summary"])
+        self.assertEqual(code, 0)
+        self.assertIn("warning: skipped Vela Krinn", err)
+        self.assertIn("1 characters", out)
+        self.assertIn("6.00M", out)    # totals only count the character that answered
+
+
+class AttributesCommandTests(CommandTestCase):
+    def test_attributes_remaps_and_the_effective_values_note(self):
+        # The accelerator line this used to pin read `accelerator_bonus_days`, a key live ESI
+        # stopped sending (spec + two stored characters checked 2026-09-13); remaps now come
+        # from `bonus_remaps`.
+        code, out, err = self.env.run(["attributes"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Ada Vane (id 91000001)", out)
+        self.assertIn("PER 23", out)
+        self.assertIn("remaps available: 2", out)
+        self.assertIn("last remap: 2025-03-01", out)
+        self.assertIn("Vela Krinn (id 91000002)", out)
+        self.assertIn("last remap: never", out)  # ESI sends null, not an empty date
+        self.assertIn("effective attributes - fitted implant bonuses are included", out)
+
+    def test_character_without_consent_degrades_to_a_hint(self):
+        self.env.write_tokens([
+            self.env.token_for(ADA),
+            self.env.token_for(VELA, scopes=["publicData"]),
+        ])
+        code, out, _ = self.env.run(["attributes"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ada Vane (id 91000001)", out)
+        self.assertIn("Vela Krinn: no skills consent", out)
+        self.assertNotIn("Vela Krinn (id", out)  # hinted, not fetched
+
+
+class StandingsCommandTests(CommandTestCase):
+    def test_live_list_shape_is_named_sorted_and_formatted(self):
+        self.env.install_standings()
+        code, out, _ = self.env.run(["standings"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ada Vane (id 91000001)", out)
+        self.assertIn("Agent Six", out)
+        self.assertIn("+3.50", out)
+        self.assertIn("-1.25", out)
+        self.assertIn("id 500001", out)  # unresolvable faction id stays visible as an id
+        self.assertLess(out.index("Agent Six"), out.index("Science and Trade Institute"))
+        self.assertIn("login --scopes standings", out)  # Vela's missing-consent hint
+        self.assertIn("'Vela Krinn'", out)
+
+    def test_csv_stdout_stays_machine_readable(self):
+        self.env.install_standings()
+        code, out, err = self.env.run(["standings", "--csv"])
+        self.assertEqual(code, 0)
+        self.assertIn("no standings consent", err)   # hints go to stderr...
+        self.assertNotIn("consent", out)             # ...never into the CSV stream
+        rows = list(csv.DictReader(out.splitlines()))
+        self.assertEqual(rows[0]["kind"], "agent")
+        self.assertEqual([r["standing"] for r in rows], ["+3.50", "-1.25", "+0.00"])
+        self.assertEqual(rows[2]["name"], "id 500001")
+
+
+class JobsCommandTests(CommandTestCase):
+    """`jobs` against jobs spelled the way ESI spells them (`fake_esi.industry_jobs`).
+
+    The view used to read `activity`, `output_type_id`, `installed_in` and `finish_date`, none of
+    which ESI sends, so every row rendered as "activity None" with the product, runs and time
+    columns empty. These tests pin each of those four columns to a real payload."""
+
+    def rows(self, *args):
+        self.env.install_jobs()
+        code, out, err = self.env.run(["jobs", "--csv", *args])
+        self.assertEqual(code, 0)
+        self.assertIn("no jobs consent", err)   # Vela's hint stays off stdout in CSV mode
+        return list(csv.DictReader(out.splitlines()))
+
+    def test_times_report_measured_hours_per_run_and_skip_paused_jobs(self):
+        self.env.install_jobs()
+        code, out, err = self.env.run(["jobs", "--char", "Ada", "--times", "--finish-window", "00-24",
+                                       "--max-hours", "1", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        times = {(r["activity"], r["product"]): r for r in doc["documents"][0]["times"]}
+        # 10 runs over 2.5 h; the invention's 10 attempts over one hour (a delivered job counts).
+        self.assertAlmostEqual(0.25, times[("manufacturing", "Tritanium")]["hours_per_run"])
+        self.assertEqual(1, times[("invention", next(p for a, p in times if a == "invention"))]["jobs"])
+        # The paused job's stale end date is not a run time.
+        self.assertNotIn(("manufacturing", "Mexallon"), times)
+        # 00-24 accepts every end, so each fit is the most runs within --max-hours.
+        self.assertEqual(4, times[("manufacturing", "Tritanium")]["fits"][0]["runs"])
+        code, text, _ = self.env.run(["jobs", "--char", "Ada", "--times"])
+        self.assertEqual(code, 0)
+        self.assertIn("h/run", text)
+
+    def since(self, *args, operation_doc=None):
+        self.env.install_jobs()
+        if operation_doc is not None:
+            with open(os.path.join(self.env.config_home, "eve-skills", "operation.json"), "w") as fh:
+                json.dump(operation_doc, fh)
+        code, out, err = self.env.run(["jobs", "--since", *args])
+        self.assertEqual(code, 0, err)
+        return out, err
+
+    def test_since_lists_jobs_installed_after_the_moment_delivered_ones_included(self):
+        out, _ = self.since(iso(-100000), "--char", "Ada", "--json")
+        doc = json.loads(out)
+        self.assertEqual("UTC", doc["time_zone"])
+        jobs = doc["documents"][0]["jobs"]
+        # All five jobs started within 100000 s, the delivered invention too (--since implies --completed);
+        # ordered by start.
+        self.assertEqual(["copying", "invention", "manufacturing", "material efficiency research",
+                          "manufacturing"], [row["activity"] for row in jobs])
+        invention = jobs[1]
+        self.assertEqual({"installer", "installer_id", "activity", "product", "product_id", "runs", "count",
+                          "facility_id", "facility", "blueprint_ids", "start", "end", "status"}, set(invention))
+        self.assertEqual(("delivered", 10, 1, [1055717845488], 60015129),
+                         (invention["status"], invention["runs"], invention["count"], invention["blueprint_ids"],
+                          invention["facility_id"]))
+        self.assertIsNotNone(doc["documents"][0]["cache"])   # jobs data time per owner, characters too
+
+    def test_since_keeps_only_jobs_started_at_or_after_it(self):
+        out, _ = self.since(iso(-20000), "--char", "Ada", "--json")
+        rows = json.loads(out)["documents"][0]["jobs"]
+        self.assertEqual(["material efficiency research", "manufacturing"], [row["activity"] for row in rows])
+        self.assertEqual(["active", "active"], [row["status"] for row in rows])
+
+    def test_since_table_names_the_moment_and_the_data_time(self):
+        out, _ = self.since(iso(-20000), "--char", "Ada", "--tz", "+03:00")
+        self.assertIn("jobs installed since", out)
+        self.assertIn("jobs as of", out)
+        self.assertIn("Tritanium", out)
+        self.assertNotIn("copying", out)     # the copy job started before
+
+    def test_since_site_reads_the_site_characters_and_labels_its_facilities(self):
+        doc = {"sites": {"home": {"owner": "personal", "facility": "jita-desk", "characters": ["Ada Vane"]}},
+               "facilities": {"jita-desk": {"location_id": 60003760, "system": "Jita"}},
+               "planning": {"timezone": "+02:00"}}
+        out, _ = self.since(iso(-20000), "--site", "home", "--json", operation_doc=doc)
+        doc = json.loads(out)
+        self.assertEqual(("home", "+02:00"), (doc["site"], doc["time_zone"]))
+        self.assertEqual(["Ada Vane"], [d["owner"] for d in doc["documents"]])   # Vela is not on the site
+        self.assertEqual({"jita-desk"}, {row["facility"] for row in doc["documents"][0]["jobs"]})
+
+    def test_since_refuses_times_slots_and_csv(self):
+        self.env.install_jobs()
+        for extra in (["--times"], ["--slots"], ["--csv"], ["--group"]):
+            with self.subTest(extra=extra):
+                code, _, err = self.env.run(["jobs", "--since", "08:00", *extra])
+                self.assertNotEqual(0, code)
+                self.assertIn("--since", err)
+
+    def test_window_flags_need_times(self):
+        self.env.install_jobs()
+        code, _, err = self.env.run(["jobs", "--finish-window", "08-10"])
+        self.assertNotEqual(0, code)
+        self.assertIn("--times", err)
+
+    def test_running_jobs_are_named_counted_and_timed(self):
+        self.env.install_jobs()
+        code, out, _ = self.env.run(["jobs"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("activity None", out)  # the bug, in the words it printed
+        self.assertIn("manufacturing", out)
+        self.assertIn("material efficiency research", out)
+        self.assertIn("copying", out)
+        self.assertIn("Tritanium", out)         # product_type_id, resolved
+        self.assertIn("left", out)              # counted down against ESI's clock
+        self.assertIn("Jita - Mradd", out)      # facility_id, resolved
+        self.assertIn("no jobs consent", out)   # Vela hint
+
+    def test_a_finished_job_esi_still_calls_active_reads_as_ready(self):
+        statuses = [r["status"] for r in self.rows()]
+        # Running jobs only, chronological: the paused one, the copy that is ready, then the two
+        # still running. The delivered invention job needs --completed to appear at all.
+        self.assertEqual(statuses, ["paused", "ready", "active", "active"])
+
+    def test_columns_are_chronological_and_named(self):
+        rows = self.rows()
+        ready = rows[1]
+        self.assertEqual(ready["activity"], "copying")
+        self.assertEqual(ready["product"], "Field Extender I Blueprint")
+        self.assertEqual(ready["runs"], "1 x60")          # one copy, licensed for 60 runs
+        self.assertEqual(ready["installed_in"], "Rens - Datauri")
+        running = rows[-1]
+        self.assertEqual(running["product"], "Tritanium")
+        self.assertEqual(running["runs"], "10")
+        self.assertTrue(running["time"].endswith("left"))
+
+    def test_a_paused_job_promises_no_time_and_names_its_structure_by_id(self):
+        paused = self.rows()[0]
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(paused["time"], "-")   # its end_date went stale when the clock stopped
+        # A player structure is not nameable through /universe/names; the id is the honest answer.
+        self.assertEqual(paused["installed_in"], f"id {JOB_STRUCTURE}")
+
+    def test_completed_adds_the_delivered_jobs(self):
+        rows = self.rows("--completed")
+        self.assertEqual([r["status"] for r in rows],
+                         ["delivered", "paused", "ready", "active", "active"])
+        delivered = rows[0]
+        self.assertEqual(delivered["activity"], "invention")
+        self.assertEqual(delivered["product"], "Field Extender II Blueprint")
+        self.assertEqual(delivered["runs"], "3/10")   # successful_runs out of attempts
+        self.assertFalse(delivered["time"].endswith("left"))
+
+    def test_corp_jobs_read_the_endpoints_own_location_field(self):
+        """The corporation endpoint sends `location_id` and no `station_id` at all."""
+        rows = self.rows("--corp")
+        self.assertEqual([r["status"] for r in rows], ["paused", "ready", "active", "active"])
+        self.assertEqual(rows[1]["installed_in"], "Rens - Datauri")
+        self.assertEqual(rows[-1]["product"], "Tritanium")
+
+    def test_corporation_csv_appends_installer_and_duration_fields(self):
+        rows = self.rows("--corp")
+        header = list(rows[0])
+        self.assertEqual(
+            ["character", "status", "activity", "product", "runs", "time", "installed_in"],
+            header[:7],
+        )
+        self.assertEqual(
+            ["installer", "start_date", "end_date", "duration_h", "hours_per_run"],
+            header[7:],
+        )
+        self.assertEqual("Ada Vane", rows[-1]["installer"])
+        self.assertEqual("2.5", rows[-1]["duration_h"])
+        self.assertEqual("0.25", rows[-1]["hours_per_run"])
+
+    def test_group_collapses_matching_jobs_and_formats_an_end_range(self):
+        jobs = industry_jobs()
+        duplicate = dict(jobs[-1], job_id=672100006, end_date=iso(7260))
+        rows = jobs + [duplicate]
+
+        def served(call):
+            return rows if call.query.get("include_completed") == "true" else [
+                job for job in rows if job["status"] == "active"
+            ]
+
+        self.env.server.get(
+            f"/characters/{ADA.character_id}/industry/jobs", token=ADA.token, handler=served
+        )
+        code, out, err = self.env.run(["jobs", "--group", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        grouped = [line for line in out.splitlines() if "Tritanium" in line]
+        self.assertEqual(1, len(grouped))
+        self.assertIn("Ada Vane", grouped[0])
+        self.assertIn("2", grouped[0])
+        self.assertIn("–", grouped[0])
+        self.assertIn("left", grouped[0])
+
+    def test_slots_deduplicate_personal_and_corporation_jobs(self):
+        self.env.install_jobs()
+        code, out, err = self.env.run(["jobs", "--slots", "--csv", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertEqual("", err)
+        row = next(csv.DictReader(io.StringIO(out)))
+        self.assertEqual("2", row["manufacturing_used"])
+        self.assertEqual("2", row["science_used"])
+        self.assertEqual("1", row["science_ready"])
+        self.assertEqual("1", row["manufacturing_max"])
+        self.assertEqual("1", row["science_max"])
+
+    def test_slots_keep_used_counts_when_skills_scope_is_missing(self):
+        self.env.install_jobs()
+        scopes = [
+            scope
+            for scope in sso.SCOPES + sso.scopes_for(["jobs"])
+            if scope != "esi-skills.read_skills.v1"
+        ]
+        self.env.write_tokens([self.env.token_for(ADA, scopes)])
+        code, out, err = self.env.run(["jobs", "--slots", "--csv"])
+        self.assertEqual((code, err), (0, ""))
+        row = next(csv.DictReader(io.StringIO(out)))
+        self.assertEqual("2", row["manufacturing_used"])
+        self.assertEqual("", row["manufacturing_max"])
+        self.assertEqual("", row["manufacturing_free"])
+
+    def test_corporation_jobs_are_read_once_for_colleagues_in_one_corp(self):
+        self.env.install_jobs()
+        self.env.install_orders()
+        code, out, err = self.env.run(["jobs", "--corp"])
+        self.assertEqual(code, 0)
+        self.assertEqual(1, out.count(f"Corporation {CORP_SHARED} (read by Ada Vane)"))
+        self.assertEqual(
+            1,
+            len(self.env.server.calls_to(f"/corporations/{CORP_SHARED}/industry/jobs")),
+        )
+    def test_corporation_cache_time_is_available_in_every_format(self):
+        self.env.install_jobs()
+        code, out, err = self.env.run(["jobs", "--corp", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertIn("corp jobs as of ", out)
+        self.assertIn(", next refresh ", out)
+
+        code, out, err = self.env.run(["jobs", "--corp", "--json", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        cache = json.loads(out)["documents"][0]["cache"]
+        self.assertTrue(cache["last_modified"].endswith("Z"))
+        self.assertTrue(cache["expires"].endswith("Z"))
+
+        code, out, err = self.env.run(["jobs", "--corp", "--csv", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertIn("corp jobs as of ", err)
+        self.assertNotIn("corp jobs as of ", out)
+
+
+
+
+
+class BlueprintsCommandTests(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.env.install_blueprints()
+
+    def test_bpo_bpc_encoding_and_station_names(self):
+        code, out, err = self.env.run(["blueprints", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Field Extender I Blueprint", out)
+        self.assertIn("BPO", out)
+        self.assertIn("BPC", out)
+        self.assertIn("Jita - Mradd", out)
+
+    def test_corporation_groups_identical_copies_and_stacked_originals(self):
+        code, out, err = self.env.run(["blueprints", "--corp", "--csv", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertIn("corp blueprints as of ", err)
+        rows = list(csv.DictReader(io.StringIO(out)))
+        copy = next(row for row in rows if row["kind"] == "BPC")
+        self.assertEqual(("10", "7", "14", "2"), (
+            copy["runs"], copy["me"], copy["te"], copy["count"]
+        ))
+        stacked = next(row for row in rows if row["kind"] == "BPO" and row["me"] == "0")
+        self.assertEqual("2", stacked["count"])
+        self.assertEqual("T2-Prod", copy["division"])
+
+    def test_idle_joins_jobs_on_blueprint_item_id(self):
+        self.env.install_jobs()
+        code, out, err = self.env.run(
+            ["blueprints", "--corp", "--idle", "--items", "--csv", "--char", "Ada"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("corp blueprints as of ", err)
+        rows = list(csv.DictReader(io.StringIO(out)))
+        self.assertNotIn("1055717863075", {row["item_id"] for row in rows})
+        self.assertEqual({"2201", "2202", "2203"}, {row["item_id"] for row in rows})
+
+    def test_idle_without_jobs_consent_explains_unapplied_filter(self):
+        scopes = sso.SCOPES + sso.scopes_for(["blueprints"])
+        self.env.write_tokens([self.env.token_for(ADA, scopes)])
+        code, out, err = self.env.run(["blueprints", "--idle", "--csv"])
+        self.assertEqual(code, 0)
+        self.assertIn("--idle could not be applied", err)
+        self.assertEqual(2, len(list(csv.DictReader(io.StringIO(out)))))
+
+    def test_filters_group_order_and_machine_formats(self):
+        code, out, err = self.env.run([
+            "blueprints", "--corp", "--copies", "--division", "T2-Prod",
+            "--type", "Extender II", "--group-by", "division", "--json", "--char", "Ada",
+        ])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        rows = doc["owners"][0]["blueprints"]
+        self.assertEqual(1, len(rows))
+        self.assertEqual(("BPC", 2, "T2-Prod"), (
+            rows[0]["kind"], rows[0]["count"], rows[0]["division"]
+        ))
+
+        code, out, err = self.env.run(
+            ["blueprints", "--corp", "--items", "--csv", "--char", "Ada"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("corp blueprints as of ", err)
+        items = list(csv.DictReader(io.StringIO(out)))
+        self.assertIn("item_id", items[0])
+        self.assertEqual(4, len(items))
+
+    def test_division_name_mapping_and_numbered_fallback(self):
+        self.assertEqual(4, divisions.number("CorpSAG4"))
+        self.assertEqual("T2-Prod", divisions.label("CorpSAG4", {4: "T2-Prod"}))
+        self.assertEqual("division 4", divisions.label("CorpSAG4"))
+        self.assertEqual("CorpDeliveries", divisions.label("CorpDeliveries", {4: "T2-Prod"}))
+
+        scopes = sso.SCOPES + sso.scopes_for(["blueprints"])
+        self.env.write_tokens([self.env.token_for(ADA, scopes)])
+        code, out, err = self.env.run(["blueprints", "--corp", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("division 4", out)
+        self.assertIn("login --scopes divisions", out)
+    def test_cache_fields_and_delivery_warning_track_the_blueprint_snapshot(self):
+        self.env.install_blueprints(age=90_000)
+        code, out, err = self.env.run(["blueprints", "--corp", "--json", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        cache = doc["owners"][0]["documents"]["blueprints"]
+        self.assertTrue(cache["last_modified"].endswith("Z"))
+        self.assertIn("1 job delivered after the blueprint snapshot", doc["warnings"][0])
+
+        self.env.install_blueprints(age=300)
+        code, out, err = self.env.run(["blueprints", "--corp", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("corp blueprints as of ", out)
+        self.assertNotIn("delivered after the blueprint snapshot", out)
+
+
+
+class CanBuildCommandTests(CommandTestCase):
+    def test_rounding_binding_cap_and_builder_skills(self):
+        self.env.install_can_build()
+        code, out, err = self.env.run([
+            "can-build", "--corp", "--char", "Ada", "--builders", "Ada Vane,Vela Krinn",
+            "--json",
+        ])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        row = doc["documents"][0]["rows"][0]
+        self.assertEqual((2, 10, 7, 2), (
+            row["blueprints"], row["runs_per_job"], row["me"], row["jobs"]
+        ))
+        self.assertEqual(("Widget Plate", 76, 38), (
+            row["limiting_material"], row["have"], row["per_job"]
+        ))
+        self.assertEqual([True, True], [check["ok"] for check in row["builders"]])
+        self.assertTrue(doc["documents"][0]["cache"]["assets"]["last_modified"].endswith("Z"))
+        self.assertEqual([], [call for call in self.env.server.calls if "/markets/" in call.path])
+
+    def test_builder_failure_and_other_division_note(self):
+        self.env.install_can_build(other_division=True)
+        self.env.set_trained_level(VELA, SKILL_CAPPED, 2)
+        code, out, err = self.env.run([
+            "can-build", "--corp", "--char", "Ada", "--builders", "Vela Krinn",
+        ])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Widget Plate: 0 in T2-Prod, 76 in Invention", out)
+        self.assertIn("Input Material Location", out)
+        self.assertIn("✗ Vela Krinn", out)
+
+    def test_csv_keeps_cache_lines_off_stdout(self):
+        self.env.install_can_build()
+        code, out, err = self.env.run([
+            "can-build", "--corp", "--char", "Ada", "--builders", "Ada Vane", "--csv",
+        ])
+        self.assertEqual(code, 0)
+        row = next(csv.DictReader(io.StringIO(out)))
+        self.assertEqual("2", row["jobs"])
+        self.assertEqual("Ada Vane:yes", row["builders"])
+        self.assertIn("corp assets as of ", err)
+        self.assertNotIn("corp assets as of ", out)
+
+
+class IndustryStatusTests(CommandTestCase):
+    def setUp(self):
+        super().setUp()
+        self.env.install_industry_status()
+
+    def used_copy_jobs(self, *specs):
+        """(job_id, blueprint_id, runs, completed offset s) -> delivered manufacturing jobs by Ada."""
+        return [{"job_id": job_id, "activity_id": 1, "status": "delivered", "installer_id": ADA.character_id,
+                 "blueprint_id": bp, "blueprint_type_id": 930001, "product_type_id": 34,
+                 "facility_id": STATION_JITA, "location_id": STATION_JITA, "runs": runs,
+                 "start_date": iso(completed - 7200), "end_date": iso(completed), "completed_date": iso(completed)}
+                for job_id, bp, runs, completed in specs]
+
+    def test_copies_used_by_jobs_delivered_after_the_blueprint_snapshot_are_dropped_or_reduced(self):
+        # Blueprint snapshot 25 h old: 930101 was used up an hour ago, 930102 lost 4 of its 10 runs, and a
+        # job delivered before the snapshot changes nothing.
+        jobs = [{k: v for k, v in dict(job, location_id=job["facility_id"]).items() if k != "station_id"}
+                for job in industry_jobs()]
+        jobs += self.used_copy_jobs((1, 930101, 10, -3600), (2, 930102, 4, -1800), (3, 930102, 5, -100000))
+        self.env.server.get(f"/corporations/{CORP_SHARED}/industry/jobs", token=ADA.token,
+                            handler=lambda call: jobs if call.query.get("include_completed") == "true"
+                            else [j for j in jobs if j["status"] == "active"])
+        code, out, err = self.env.run(["industry", "status", "--corp", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        owner = next(r for r in json.loads(out)["owners"] if r["owner_id"] == CORP_SHARED)
+        self.assertEqual({"dropped": 1, "reduced": 1}, owner["blueprint_adjustments"])
+        copies = [r for r in owner["blueprints"] if r["blueprint_type_id"] == 930001]
+        self.assertEqual([(1, 6)], [(r["count"], r["runs_per_job"]) for r in copies])
+        issue = next(w for w in owner["warnings"] if w["subject"] == "blueprint_adjustments")
+        self.assertTrue(issue["message"].startswith("1 copy dropped and 1 reduced: used by jobs delivered "
+                                                    "after the blueprint snapshot ("))
+        code, text, _ = self.env.run(["industry", "status", "--corp"])
+        self.assertIn("warning: 1 copy dropped and 1 reduced", text)
+
+    def test_personal_status_reads_finished_jobs_and_adjusts_copies_without_changing_slots(self):
+        self.env.server.get(f"/characters/{ADA.character_id}/blueprints", token=ADA.token, doc=[
+            {"item_id": 2101, "type_id": 930001, "location_id": STATION_JITA, "location_flag": "Hangar",
+             "quantity": -2, "runs": 10, "material_efficiency": 7, "time_efficiency": 14}],
+            headers={"Last-Modified": http_date(-7200), "Expires": http_date(3600)})
+        jobs = industry_jobs() + self.used_copy_jobs((9, 2101, 10, -3600))
+        self.env.server.get(f"/characters/{ADA.character_id}/industry/jobs", token=ADA.token,
+                            handler=lambda call: jobs if call.query.get("include_completed") == "true"
+                            else [j for j in jobs if j["status"] == "active"])
+        code, out, err = self.env.run(["industry", "status", "--char", "Ada", "--json"])
+        self.assertEqual(0, code, err)
+        owner = json.loads(out)["owners"][0]
+        self.assertEqual({"dropped": 1, "reduced": 0}, owner["blueprint_adjustments"])
+        self.assertEqual([], [r for r in owner["blueprints"] if r["blueprint_type_id"] == 930001])
+        call = self.env.server.calls_to(f"/characters/{ADA.character_id}/industry/jobs")[-1]
+        self.assertEqual("true", call.query.get("include_completed"))
+        ada = owner["characters"][0]
+        # Delivered jobs count for nothing: the running manufacturing job and the paused one, one ready copy.
+        self.assertEqual((2, 0), (ada["slots"]["manufacturing"]["used"], ada["slots"]["manufacturing"]["ready"]))
+        self.assertEqual(1, ada["slots"]["science"]["ready"])
+        self.assertEqual(1, len(owner["jobs"]["ready"]))
+
+    def test_corporation_snapshot_has_every_section_and_deduplicates_colleagues(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as handle:
+            handle.write("Tritanium\n")
+            filename = handle.name
+        self.addCleanup(os.unlink, filename)
+        code, out, err = self.env.run(["industry", "status", "--corp", "--materials",
+                                       filename, "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        self.assertEqual({"owner_kind", "hints", "warnings", "owners"}, set(doc))
+        self.assertEqual(2, len(doc["owners"]))
+        owner = next(r for r in doc["owners"] if r["owner_id"] == CORP_SHARED)
+        self.assertEqual(CORP_SHARED, owner["owner_id"])
+        self.assertEqual(ADA.character_id, owner["read_by_character_id"])
+        self.assertEqual({ADA.character_id, MIRA.character_id},
+                         {r["character_id"] for r in owner["characters"]})
+        self.assertEqual({"assets", "blueprints", "jobs", "orders", "divisions"},
+                         set(owner["documents"]))
+        self.assertTrue(all(d["last_modified"] and d["expires"]
+                            for d in owner["documents"].values()))
+        ada = next(r for r in owner["characters"] if r["character_id"] == ADA.character_id)
+        self.assertEqual((2, 0), (ada["slots"]["manufacturing"]["used"],
+                                  ada["slots"]["manufacturing"]["ready"]))
+        self.assertEqual(1, ada["slots"]["science"]["ready"])
+        self.assertIsNotNone(ada["slots"]["science"]["next_end"])
+        self.assertEqual(1, len(owner["jobs"]["ready"]))
+        self.assertTrue(owner["jobs"]["running"][0]["end_start"])
+        self.assertTrue(all(r["installer_id"] and r["product_type_id"] for
+                            group in owner["jobs"].values() for r in group))
+        self.assertTrue(all("end_range" not in r for group in owner["jobs"].values()
+                            for r in group))
+        bp = next(r for r in owner["blueprints"] if r["blueprint_type_id"] == 930001)
+        self.assertEqual((2, 2, 10, 7, "T2-Prod"),
+                         (bp["count"], bp["can_build_jobs"], bp["runs_per_job"],
+                          bp["me"], bp["division"]))
+        self.assertNotIn(1055717863075, [r["blueprint_type_id"] for r in owner["blueprints"]])
+        self.assertTrue(all({"activities", "invents"} <= set(r) for r in owner["blueprints"]))
+        self.assertEqual(123, next(r["quantity"] for r in owner["materials"]
+                                   if r["type_id"] == 34 and r["division"] == "T2-Prod"))
+        self.assertEqual(834, next(r["quantity"] for r in owner["deliveries"]
+                                   if r["type_id"] == 920010))
+        self.assertNotIn("CorpDeliveries", [r["division"] for r in owner["materials"]])
+        self.assertTrue(all(r["location_id"] and r["location"] for r in owner["deliveries"]))
+        self.assertEqual(75, next(r["filled_pct"] for r in owner["orders"]
+                                  if r["order_id"] == 700201))
+        self.assertEqual([{"owner_id": CORP_SHARED, "subject": "asset", "delivered_jobs": 1},
+                          {"owner_id": CORP_SHARED, "subject": "blueprint", "delivered_jobs": 1,
+                           "message": "1 job delivered after the blueprint snapshot: copies they produced "
+                                      "(invention or copying output) are not listed yet"}], owner["warnings"])
+        self.assertEqual({"dropped": 0, "reduced": 0}, owner["blueprint_adjustments"])
+        self.assertEqual(owner["warnings"], doc["warnings"])
+        for section in ("jobs", "assets", "blueprints", "orders"):
+            self.assertEqual(1, len(self.env.server.calls_to(
+                f"/corporations/{CORP_SHARED}/" +
+                {"jobs": "industry/jobs"}.get(section, section))))
+        code, text, err = self.env.run(["industry", "status", "--corp", "--materials", filename])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("75% filled", text)
+        self.assertIn("834 at Amarr", text)
+        self.assertIn("corp assets as of ", text)
+        self.assertLess(len(text.splitlines()), 60)
+
+    def test_missing_required_material_is_explicit_zero_at_blueprint_hangar(self):
+        self.env.server.get(f"/corporations/{CORP_SHARED}/assets", token=ADA.token, doc=[])
+        code, out, err = self.env.run(
+            ["industry", "status", "--corp", "--char", "Ada", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        owner = json.loads(out)["owners"][0]
+        bp = next(row for row in owner["blueprints"] if row["blueprint_type_id"] == 930001)
+        self.assertEqual(bp["can_build_jobs"], 0)
+        self.assertTrue(any(row["type_id"] == bp["limiting_type_id"] and
+                            row["quantity"] == 0 and row["division"] == "T2-Prod"
+                            for row in owner["materials"]))
+
+
+    def test_stock_inside_a_corporation_office_is_counted_and_named_by_station(self):
+        # Live ESI nests corp hangars in the office item: location_type "item", location_id = office.
+        office = 1055720303518
+        bps = [{"item_id": 930101 + i, "type_id": 930001, "location_id": office,
+                "location_flag": "CorpSAG4", "quantity": -2, "runs": 10,
+                "material_efficiency": 7, "time_efficiency": 14} for i in range(2)]
+        self.env.server.get(f"/corporations/{CORP_SHARED}/blueprints", token=ADA.token, doc=bps)
+        stock = {BUILD_PLATE: 76, BUILD_HOUSING: 500, BUILD_CELL: 100, BUILD_PASTE: 100}
+        rows = [{"item_id": office, "type_id": 27, "quantity": 1, "location_id": STATION_JITA,
+                 "location_flag": "OfficeFolder", "location_type": "station", "is_singleton": True}]
+        rows += [{"item_id": 941000 + i, "type_id": type_id, "quantity": qty, "location_id": office,
+                  "location_flag": "CorpSAG4", "location_type": "item", "is_singleton": False}
+                 for i, (type_id, qty) in enumerate(stock.items())]
+        self.env.server.get(f"/corporations/{CORP_SHARED}/assets", token=ADA.token, doc=rows)
+        code, out, err = self.env.run(["industry", "status", "--corp", "--char", "Ada", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        owner = json.loads(out)["owners"][0]
+        plate = next(r for r in owner["materials"] if r["type_id"] == BUILD_PLATE)
+        self.assertEqual((76, "T2-Prod"), (plate["quantity"], plate["division"]))
+        self.assertNotIn(f"location {office}", plate["location"])
+        bp = next(r for r in owner["blueprints"] if r["blueprint_type_id"] == 930001)
+        self.assertEqual(2, bp["can_build_jobs"])
+        self.assertEqual(plate["location"], bp["location"])
+
+    def test_personal_status_uses_personal_documents_without_corp_reads(self):
+        code, out, err = self.env.run(["industry", "status", "--char", "Ada", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        self.assertEqual("character", doc["owner_kind"])
+        self.assertEqual([ADA.character_id], [r["owner_id"] for r in doc["owners"]])
+        owner = doc["owners"][0]
+        self.assertEqual(2, len(owner["orders"]))
+        self.assertEqual(60, owner["orders"][0]["filled_pct"])
+        self.assertTrue(owner["availability"]["assets"])
+        self.assertEqual([], owner["deliveries"])
+        self.assertFalse(any(call.path.startswith("/corporations/") for call in self.env.server.calls))
+
+    def test_each_missing_consent_is_local_to_its_section(self):
+        mapping = {
+            "esi-industry.read_corporation_jobs.v1": "jobs",
+            "esi-corporations.read_blueprints.v1": "blueprints",
+            "esi-assets.read_corporation_assets.v1": "assets",
+            "esi-markets.read_corporation_orders.v1": "orders",
+            "esi-corporations.read_divisions.v1": "divisions",
+            "esi-skills.read_skills.v1": "skills",
+        }
+        full = sso.SCOPES + sso.scopes_for(["all"])
+        for scope, section in mapping.items():
+            with self.subTest(section=section):
+                self.env.write_tokens([self.env.token_for(ADA, [s for s in full if s != scope])])
+                code, out, err = self.env.run(["industry", "status", "--corp", "--json"])
+                self.assertEqual((code, err), (0, ""))
+                doc = json.loads(out)
+                owner = doc["owners"][0]
+                self.assertTrue(any(hint.get("section") == section and
+                                    hint.get("code") == "missing_consent" and
+                                    hint.get("scope") == scope for hint in doc["hints"]))
+                if section in owner["availability"]:
+                    self.assertFalse(owner["availability"][section])
+                if section == "jobs":
+                    self.assertEqual([], owner["blueprints"])
+                elif section == "assets":
+                    self.assertEqual([], owner["materials"])
+                    self.assertIsNone(owner["blueprints"][0]["can_build_jobs"])
+                elif section == "orders":
+                    self.assertEqual([], owner["orders"])
+                elif section == "divisions":
+                    self.assertEqual("division 4", owner["blueprints"][0]["division"])
+                elif section == "skills":
+                    self.assertIsNone(owner["characters"][0]["slots"]["manufacturing"]["max"])
+
+    def test_corp_jobs_without_personal_consent_do_not_claim_free_slots(self):
+        scopes = [s for s in sso.SCOPES + sso.scopes_for(["all"])
+                  if s != "esi-industry.read_character_jobs.v1"]
+        self.env.write_tokens([self.env.token_for(ADA, scopes)])
+        code, out, err = self.env.run(["industry", "status", "--corp", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        owner = doc["owners"][0]
+        self.assertTrue(owner["availability"]["jobs"])
+        self.assertEqual(2, owner["blueprints"][0]["can_build_jobs"])
+        self.assertFalse(owner["characters"][0]["complete"])
+        self.assertIsNone(owner["characters"][0]["slots"]["manufacturing"]["free"])
+        self.assertTrue(any(hint.get("section") == "personal_jobs" and
+                            hint.get("code") == "missing_consent" for hint in doc["hints"]))
+
+
+class InventoryCommandTests(CommandTestCase):
+    """`inventory` named, placed and valued.
+
+    The fixture (`fake_esi.install_inventory`) is built so every contrast the view has to get right
+    is present at once: a type ESI prices by average, one only by its industry figure, one published
+    at 0.0 and one with no price row; a named ship carrying a named container; two player structures,
+    one nameable and one answering 403; and buy orders at two stations, so a hub scope can be shown
+    to read only the hub's."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.install_inventory()
+
+    def csv_rows(self, *argv) -> dict[str, dict]:
+        code, out, _ = self.env.run(["inventory", "--csv", *argv])
+        self.assertEqual(code, 0)
+        return {r["item_id"]: r for r in csv.DictReader(out.splitlines())}
+
+    def ids_asked_of_names(self) -> list[int]:
+        """Every id this run posted to `/universe/names`, across all its batches."""
+        return [ident for call in self.env.server.calls if call.path == "/universe/names"
+                for ident in (call.json or [])]
+
+    @staticmethod
+    def table(lines: list[str]) -> tuple[str, list[str]]:
+        """The header and data rows of the run's first table, located by its rule of dashes rather
+        than a fixed offset - hints and per-owner headings move that offset around. The table ends
+        at its blank line, so the footnotes below it are never mistaken for rows."""
+        rule = next(i for i, line in enumerate(lines) if line.strip() and set(line) <= set("- "))
+        body = []
+        for line in lines[rule + 1:]:
+            if not line.strip():
+                break
+            if not line.startswith("TOTAL"):
+                body.append(line)
+        return lines[rule - 1], body
+
+    # -- the names this command exists for ------------------------------------
+
+    def test_legacy_csv_columns_keep_their_order_and_meaning(self):
+        """The nine columns an owner's spreadsheets already read, in the order they were published -
+        `item_name` derived from `type_id`, because ESI retired the `typeID` field."""
+        code, out, _ = self.env.run(["inventory", "--csv"])
+        self.assertEqual(code, 0)
+        header = out.splitlines()[0].split(",")
+        self.assertEqual(header[:9], ["character", "item_id", "type_id", "item_name", "quantity",
+                                      "singleton", "flag", "location_id", "location_name"])
+        rows = {r["item_id"]: r for r in csv.DictReader(out.splitlines())}
+        self.assertEqual(rows["1001"]["item_name"], "Tritanium")       # via type_id, not retired typeID
+        self.assertEqual(rows["1002"]["item_name"], "Caldari Ship Blueprint")
+        self.assertEqual(rows["1002"]["singleton"], "1")
+        self.assertTrue(all(r["character"] == "Ada Vane" for r in rows.values()))
+
+    def test_nothing_is_left_an_id_although_container_ids_overflow_int32(self):
+        """The bug this view used to have: container and structure ids are item-sized, and ESI fails
+        the *whole* `/universe/names` batch when one is posted - so mixing them in cost every name in
+        the batch. The fake reproduces that 400, which makes 'every row is named' a real pin here."""
+        rows = self.csv_rows()
+        self.assertEqual(len(rows), 9)     # two asset pages, nothing dropped
+        # Exactly one row may be a label - the structure ESI refused - and it must be that one.
+        blind = f"structure {INV_CITADEL_BLIND}"
+        unnamed = [r for r in rows.values() if r["location_name"] == blind]
+        self.assertEqual(1, len(unnamed))
+        for row in rows.values():
+            self.assertNotRegex(row["item_name"], r"^type \d+$", "unresolved type name")
+            self.assertTrue(row["location_name"], "row left with a bare location id")
+            if row is not unnamed[0]:
+                self.assertNotRegex(row["location_name"], r"^(location|structure|item) \d+$",
+                                    f"{row['item_id']} fell back to a placeholder")
+        # The nameable structure is named from /universe/structures, never guessed.
+        self.assertEqual("Keepstar Outpost", rows["1006"]["location_name"])
+        asked = self.ids_asked_of_names()
+        self.assertTrue(asked, "station names never went through /universe/names")
+        self.assertEqual([i for i in asked if not -2**31 <= i <= 2**31 - 1], [],
+                         "an item-sized id was posted to /universe/names, which fails every name")
+
+    def test_group_and_category_come_from_the_catalogue_not_a_guess(self):
+        rows = self.csv_rows()
+        self.assertEqual((rows["1001"]["group_name"], rows["1001"]["category_name"]),
+                         ("Ore", "Material"))
+        ship, container = rows[str(INV_SHIP_ITEM)], rows[str(INV_CONTAINER_ITEM)]
+        self.assertEqual((ship["group_name"], ship["category_name"]), ("Frigate", "Ship"))
+        self.assertEqual((container["group_name"], container["category_name"]),
+                         ("Container", "Container"))
+        # A custom name is its own column; the display name keeps both.
+        self.assertEqual(ship["custom_name"], "Nightwatch")
+
+    def test_nested_items_render_the_whole_path(self):
+        """`location_id` alone cannot say which ship's cargo bay - and live ESI gives no other way."""
+        rows = self.csv_rows()
+        inside = rows["1003"]
+        self.assertEqual(inside["location_name"], "Second Shift")
+        self.assertEqual(inside["location_path"], "Jita - Mradd > Nightwatch > Second Shift")
+        self.assertEqual(inside["location_kind"], "container")
+        self.assertEqual(inside["flag"], "Cargo")   # `location_flag` from ESI, kept its CSV name
+        code, out, _ = self.env.run(["inventory", "--items"])
+        self.assertEqual(code, 0)
+        self.assertIn("Jita - Mradd > Nightwatch > Second Shift", out)
+        self.assertIn("Nightwatch (Rifter)", out)   # a singleton is named as its owner named it
+
+    # -- grouping and totals --------------------------------------------------
+
+    def test_summary_groups_by_place_with_a_subtotal_and_a_labelled_total(self):
+        code, out, _ = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ada Vane (9 asset rows)", out)
+        header, _ = self.table(out.splitlines())
+        self.assertTrue(header.startswith("location"), header)
+        self.assertEqual(2, len(self.env.server.calls_to(f"/characters/{ADA.character_id}/assets")))
+        # The ship, its container and the container's contents are all at Jita, so they subtotal
+        # together - 1,700 units of ore is 500 in the hangar plus 1,200 two levels down.
+        self.assertIn("subtotal Jita - Mradd", out)
+        self.assertIn("1,703", out)
+        # The ISK covers only the priced rows, so the units in that sentence are the priced ones:
+        # 2,558 held minus the blueprint's single unpriced unit.
+        self.assertIn("TOTAL (ESI reference): 12,012,339.00 ISK over 2,557 units of 4 distinct "
+                      "types; 1 more type held, none priced", out)
+        self.assertIn("no assets consent", out)     # Vela hint, unchanged behaviour
+
+    def test_by_category_transposes_the_same_numbers(self):
+        code, by_location, _ = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        code, out, _ = self.env.run(["inventory", "--by", "category"])
+        self.assertEqual(code, 0)
+        header, _ = self.table(out.splitlines())
+        self.assertTrue(header.startswith("category"), header)   # swapped: the outer key leads
+        self.assertIn("subtotal Material", out)
+        self.assertIn("12,339.00", out)               # ore only; the ship is its own category
+        self.assertIn("Jita - Mradd > Nightwatch > Second Shift", out)
+        # Same holdings, same money, whichever way the table is turned.
+        total = [line for line in out.splitlines() if line.startswith("TOTAL")][0]
+        self.assertEqual(total, [line for line in by_location.splitlines() if line.startswith("TOTAL")][0])
+
+    def test_items_are_ordered_by_value_and_unpriced_rows_last(self):
+        code, out, _ = self.env.run(["inventory", "--items"])
+        self.assertEqual(code, 0)
+        _, body = self.table(out.splitlines())
+        self.assertTrue(body[0].startswith("Nightwatch (Rifter)"), body[0])
+        self.assertTrue(body[-1].startswith("Caldari Ship Blueprint"), body[-1])
+        self.assertIn("-              -", body[-1])   # no price, not a free item
+        # Descending within a type too: the ranking is by money, not by name or quantity.
+        self.assertEqual(["5,844.00", "3,409.00", "2,435.00"],
+                         [line.split()[-1] for line in body if line.startswith("Tritanium")])
+
+    def test_unpriced_types_are_counted_named_and_left_out_of_every_total(self):
+        """Three states have to stay distinct: priced, published at zero, and absent. Only the last
+        one is missing, and saying so is the difference between a valuation and a guess."""
+        code, out, _ = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        self.assertIn("no price on this basis, excluded from every total above (1): "
+                      "Caldari Ship Blueprint", out)
+        rows = self.csv_rows()
+        self.assertEqual("", rows["1002"]["unit_price"])     # absent: no number at all
+        self.assertEqual("0.00", f'{float(rows[str(INV_CONTAINER_ITEM)]["unit_price"]):.2f}')
+        # The blueprint holds a row in the Jita group and adds nothing to its subtotal.
+        _, body = self.table(out.splitlines())
+        jita = [line for line in body if line.startswith("subtotal Jita - Mradd")][0]
+        self.assertIn("12,008,279.00", jita)
+
+    # -- valuation bases ------------------------------------------------------
+
+    def test_reference_basis_is_one_request_and_says_what_it_is_not(self):
+        code, out, _ = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        self.assertEqual(1, len(self.env.server.calls_to("/markets/prices")))
+        self.assertIn("value basis: ESI's published reference price - a figure CCP publishes about "
+                      "an item, not an order anybody will fill", out)
+        self.assertIn("priced 4 of 5 distinct types held (1 request for ESI's whole price document)",
+                      out)
+
+    def test_value_at_a_hub_prices_at_that_station_only(self):
+        code, out, _ = self.env.run(["inventory", "--items", "--value-at", "jita"])
+        self.assertEqual(code, 0)
+        # Jita's richest buy is 4.20; another station in the region pays 4.30 and must not be used.
+        tritanium = [line for line in out.splitlines() if line.startswith("Tritanium")][0]
+        self.assertIn("4.20", tritanium)
+        self.assertNotIn("4.30", tritanium)
+        self.assertIn("value basis: the richest standing buy order at Jita 4-4 - what dumping the "
+                      "holding there pays right now", out)
+        # Only ore and the blueprint have buy orders here, so the total covers 2,401 of 2,558 units.
+        self.assertIn("TOTAL (max buy @ Jita 4-4): 10,083.10 ISK over 2,401 units of 2 distinct "
+                      "types; 3 more types held, none priced", out)
+        # The asks come out of the same rows, so they are free - but they reach types the buy side
+        # does not, and a comparison against the TOTAL has to cover the TOTAL's own rows. Only
+        # Tritanium is priced on both bases here (12,120.00); Pyerite has an ask and no bid, so it
+        # belongs to neither figure and is counted out loud instead of inflating the alternative.
+        self.assertIn("listing the same holdings at Jita 4-4's cheapest standing ask would raise "
+                      "12,120.00 ISK over the 1 type both bases price", out)
+        self.assertIn("1 further type is priced on that basis alone", out)
+        self.assertIn("freshness: as of ", out)
+        self.assertEqual(5, len(self.env.server.calls_to("/markets/10000002/orders")))
+        self.assertEqual([], self.env.server.calls_to("/markets/prices"))
+
+    def test_value_at_a_region_widens_past_the_station(self):
+        code, out, _ = self.env.run(["inventory", "--items", "--value-at", "The Forge"])
+        self.assertEqual(code, 0)
+        tritanium = [line for line in out.splitlines() if line.startswith("Tritanium")][0]
+        self.assertIn("4.30", tritanium)     # the region's richest buy, not Jita's
+        self.assertIn("richest standing buy order at The Forge", out)
+
+    def test_a_mistaken_value_scope_fails_before_any_asset_is_fetched(self):
+        """A typo in `--value-at` must not cost a page of holdings per character first, and must say
+        what to do about it instead of printing a traceback."""
+        code, out, err = self.env.run(["inventory", "--value-at", "Nowhere"])
+        self.assertEqual(code, 1)
+        self.assertIn("no region named 'Nowhere'", err)
+        self.assertEqual([], self.env.server.calls_to(f"/characters/{ADA.character_id}/assets"))
+        code, _, err = self.env.run(["inventory", "--value-at", "  "])
+        self.assertEqual(code, 1)
+        self.assertIn("empty --value-at", err)
+
+    def test_a_dead_shard_is_reported_as_missing_rather_than_worthless(self):
+        code, out, _ = self.env.run(["inventory", "--value-at", str(MARKET_BROKEN)])
+        self.assertEqual(code, 0)
+        self.assertIn("nothing priced on this basis (5 distinct types held)", out)
+        self.assertIn("did not answer; their types are counted as unpriced above, not as worthless",
+                      out)
+
+    # -- degradation ----------------------------------------------------------
+
+    def test_a_structure_without_consent_is_labelled_once_and_says_how_to_fix_it(self):
+        code, out, _ = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"structure {INV_CITADEL_BLIND}", out)
+        self.assertEqual(1, out.count("could not be resolved"),
+                         "the notice repeated per row instead of once per run")
+        self.assertIn("neworks login --scopes structures", out)
+
+    def test_empty_inventory_says_so_without_inventing_a_value(self):
+        self.env.server.get(f"/characters/{ADA.character_id}/assets", token=ADA.token, doc=[])
+        code, out, err = self.env.run(["inventory", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertIn("(inventory empty)", out)
+        self.assertNotIn("value basis", out + err)     # nothing was valued; nothing to footnote
+        self.assertEqual([], self.env.server.calls_to("/markets/prices"))
+
+    def test_csv_keeps_hints_and_footnotes_off_stdout(self):
+        code, out, err = self.env.run(["inventory", "--csv"])
+        self.assertEqual(code, 0)
+        for line in out.splitlines():
+            self.assertNotIn("consent", line)
+        self.assertIn("no assets consent", err)
+        self.assertIn("value basis:", err)
+        self.assertTrue(out.startswith("character,item_id,"))
+
+    def test_one_refused_owner_warns_without_silencing_the_others(self):
+        """Mira is stored with the consent and refused anyway (revoked server-side). Ada's holdings
+        must still render, and the refusal must reach the user - as prose on stderr, as data in JSON."""
+        self.env.write_tokens([
+            self.env.token_for(ADA, sso.SCOPES + sso.scopes_for(["all"])),
+            self.env.token_for(VELA),
+            self.env.token_for(MIRA, sso.SCOPES + sso.scopes_for(["all"])),
+        ])
+        self.env.server.get(f"/characters/{MIRA.character_id}",
+                            doc={"name": MIRA.name, "bloodline_id": 403,
+                                 "corporation_id": CORP_SHARED})
+        self.env.server.get(f"/characters/{MIRA.character_id}/assets", token=MIRA.token,
+                            error=(403, {"error": "consent revoked"}))
+        code, out, err = self.env.run(["inventory"])
+        self.assertEqual(code, 0)
+        self.assertIn("Mira Solen: ESI refused", err)
+        self.assertIn("Ada Vane (9 asset rows)", out)
+        _, out, err = self.env.run(["inventory", "--json"])
+        doc = json.loads(out)
+        self.assertEqual([], [line for line in err.splitlines() if line.startswith("warning:")])
+        self.assertEqual(1, len(doc["warnings"]))
+        self.assertIn("Mira Solen", doc["warnings"][0])
+
+    def test_a_row_priced_by_the_fallback_figure_says_so(self):
+        # `average_price` and `adjusted_price` are different published numbers. Where a held type
+        # has only the second, the total quietly mixes a trade average with CCP's industry
+        # reference, so the run has to say how many rows that covers and mark them per row.
+        code, out, _ = self.env.run(["inventory", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        self.assertIn("had no published average price, so CCP's industry reference", out)
+        code, csv_out, _ = self.env.run(["inventory", "--char", "Ada", "--csv"])
+        rows = list(csv.DictReader(io.StringIO(csv_out)))
+        bases = {row["item_name"]: row["price_basis"] for row in rows}
+        self.assertEqual("esi_adjusted", bases["Rifter"])      # adjusted_price only
+        self.assertEqual("esi_reference", bases["Tritanium"])  # has a published average
+
+    def test_json_is_one_document_carrying_ids_and_names_together(self):
+        code, out, err = self.env.run(["inventory", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual("", err)     # hints and footnotes are in the document, not beside it
+        doc = json.loads(out)
+        self.assertEqual("esi_reference", doc["value_basis"]["key"])
+        self.assertEqual(["Caldari Ship Blueprint"], doc["value_basis"]["unpriced_types"])
+        self.assertEqual(1, len(doc["hints"]))     # Vela, machine-readable as ever
+        owner = doc["characters"][0]
+        self.assertEqual(9, owner["asset_rows"])
+        self.assertEqual({"types": 5, "units": 2558, "priced_units": 2557, "priced_types": 4,
+                          "unpriced_types": 1},
+                         {k: owner["totals"][k] for k in ("types", "units", "priced_units",
+                                                          "priced_types", "unpriced_types")})
+        item = [i for i in owner["items"] if i["item_id"] == 1003][0]
+        self.assertEqual({"id": INV_CONTAINER_ITEM, "name": "Second Shift", "kind": "container"},
+                         item["location_path"][-1])
+        self.assertEqual("Jita - Mradd", item["location_path"][0]["name"])
+        self.assertEqual(5844.0, item["value"])
+        # Group cells are numbers plus names: a consumer never has to re-derive a label from an id.
+        jita = [g for g in owner["groups"] if g["name"] == "Jita - Mradd"][0]
+        self.assertEqual(12008279.0, jita["value"])
+        # `unpriced_units` travels with the pair so a consumer can tell that a group's unit count
+        # covers more than its ISK does - the blueprint entry holds one unit nothing priced.
+        self.assertIn({"name": "Ship", "types": 1, "units": 1, "value": 12000000.0,
+                       "unpriced_units": 0}, jita["entries"])
+        self.assertIn({"name": "Blueprint", "types": 1, "units": 1, "value": None,
+                       "unpriced_units": 1}, jita["entries"])
+
+    def test_corporation_inventory_asks_the_corporation_endpoints(self):
+        """A corporation run must ask about the corporation's items. Reusing the character endpoint
+        would 404 on live ESI and cost every custom name in the batch."""
+        self.env.install_corp_inventory()
+        code, out, _ = self.env.run(["inventory", "--corp", "--items"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ledger Runner (Rifter)", out)
+        names = sorted({c.path for c in self.env.server.calls if c.path.endswith("assets/names")})
+        self.assertEqual([f"/corporations/{CORP_SHARED}/assets/names"], names)
+        self.assertEqual([f"/corporations/{CORP_SHARED}/assets"],
+                         sorted({c.path for c in self.env.server.calls
+                                 if c.path.endswith("/assets")}))
+
+    def test_corporation_inventory_uses_names_and_preserves_non_hangar_flags(self):
+        self.env.install_corp_inventory()
+        code, out, err = self.env.run(["inventory", "--corp", "--items", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("T2-Prod", out)
+        self.assertIn("CorpDeliveries", out)
+
+        code, csv_out, err = self.env.run(["inventory", "--corp", "--csv", "--char", "Ada"])
+        self.assertEqual(code, 0)
+        rows = {row["item_id"]: row for row in csv.DictReader(io.StringIO(csv_out))}
+        self.assertEqual("T2-Prod", rows["2001"]["division"])
+        self.assertEqual("CorpDeliveries", rows["2002"]["division"])
+
+    def test_inventory_groups_and_filters_by_division_name(self):
+        self.env.install_corp_inventory()
+        code, out, err = self.env.run(
+            ["inventory", "--corp", "--by", "division", "--division", "T2-Prod",
+             "--char", "Ada"]
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("T2-Prod", out)
+        self.assertIn("5,000", out)
+        self.assertNotIn("Ledger Runner", out)
+        self.assertNotIn("CorpDeliveries", out)
+
+    def test_inventory_falls_back_to_numbered_divisions_without_consent(self):
+        self.env.install_corp_inventory()
+        scopes = sso.SCOPES + sso.scopes_for(["assets", "structures"])
+        self.env.write_tokens([self.env.token_for(ADA, scopes)])
+        code, out, err = self.env.run(["inventory", "--corp", "--items", "--char", "Ada"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("division 4", out)
+        self.assertIn("login --scopes divisions", out)
+    def test_cache_fields_and_delivery_warning_track_the_asset_snapshot(self):
+        self.env.install_corp_inventory(age=90_000)
+        code, out, err = self.env.run(
+            ["inventory", "--corp", "--json", "--char", "Ada"]
+        )
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        cache = doc["characters"][0]["documents"]["assets"]
+        self.assertTrue(cache["last_modified"].endswith("Z"))
+        self.assertIn("1 job delivered after the asset snapshot", doc["warnings"][0])
+
+        self.env.install_corp_inventory(age=300)
+        code, out, err = self.env.run(
+            ["inventory", "--corp", "--csv", "--char", "Ada"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("corp assets as of ", err)
+        self.assertNotIn("delivered after the asset snapshot", err)
+
+
+class TravelCommandTests(CommandTestCase):
+    def test_location_home_and_jump_clones(self):
+        self.env.install_travel()
+        code, out, _ = self.env.run(["travel"])
+        self.assertEqual(code, 0)
+        self.assertIn("current: Jita - Mradd (The Forge)", out)
+        self.assertIn("home: Jita - Mradd", out)
+        self.assertIn("last clone jump: 2026-08-01 10:00 UTC", out)
+        self.assertIn("Rens bolt-hole", out)
+        self.assertIn("Memory Augmentation", out)
+        self.assertIn("no clones consent", out)  # Vela hint
+
+    def test_csv_kinds_per_location(self):
+        self.env.install_travel()
+        code, out, err = self.env.run(["travel", "--csv"])
+        self.assertEqual(code, 0)
+        self.assertIn("no clones consent", err)
+        rows = list(csv.DictReader(out.splitlines()))
+        self.assertEqual([r["kind"] for r in rows], ["current", "home", "jump clone"])
+        jump = rows[2]
+        self.assertEqual(jump["clone_name"], "Rens bolt-hole")
+        self.assertEqual(jump["implants"], "Memory Augmentation")
+
+
+class ImplantsCommandTests(CommandTestCase):
+    def test_one_row_per_fitted_instance(self):
+        self.env.install_implants()
+        code, out, _ = self.env.run(["implants"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ada Vane (id 91000001)", out)
+        self.assertEqual(out.count("Memory Augmentation"), 2)  # same type in both head slots
+        self.assertIn("no clones consent", out)
+
+    def test_csv_rows(self):
+        self.env.install_implants()
+        code, out, err = self.env.run(["implants", "--csv"])
+        self.assertEqual(code, 0)
+        self.assertIn("no clones consent", err)
+        rows = list(csv.reader(out.splitlines()))
+        self.assertEqual(rows[0], ["character", "implant"])
+        self.assertEqual(rows[1:], [["Ada Vane", "Memory Augmentation"]] * 2)
+
+
+class DispatchSurfaceTests(unittest.TestCase):
+    """Every dispatchable command must be reachable from the parser.
+
+    A handler without a subparser is invisible (`invalid choice`), a subparser without a
+    handler is a KeyError the moment someone runs it."""
+
+    def parser_commands(self) -> set[str]:
+        actions = [a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction)]
+        self.assertEqual(len(actions), 1, "expected exactly one subcommand group")
+        return set(actions[0].choices)
+
+    def test_parser_choices_and_handlers_agree(self):
+        commands = self.parser_commands()
+        registry = cli.registry_mod.load()
+        self.assertEqual(commands, {path[0] for path in registry.commands})
+        for path, (command, _plugin) in registry.commands.items():
+            self.assertTrue(command.handler or command.run, f"{command.name} has nothing to run")
+        for command in sorted(commands):
+            with self.subTest(command=command), self.assertRaises(SystemExit) as caught:
+                cli.main([command, "--help"])
+            self.assertEqual(caught.exception.code, 0)
+
+
+class ConsoleEncodingTests(unittest.TestCase):
+    """A redirected stdout is not a console, and on Windows it encodes with the ANSI code page.
+
+    Everything this tool writes is UTF-8 - the same bytes its files hold - so a character name
+    outside cp1252 has to print anyway rather than abort the command after all its work was done.
+    The condition is forced with ``PYTHONIOENCODING`` instead of skipped: cp1252 is available on
+    every platform, and this is precisely what ``neworks events > out.txt`` is on Windows."""
+
+    NAME = "ジェーガー・Ölvsson"     # invented; the CJK half has no byte in cp1252 at all
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="neworks-console-")
+        self.addCleanup(self.tmp.cleanup)
+        self.state_home = os.path.join(self.tmp.name, "state")
+        state_dir = os.path.join(self.state_home, "eve-skills")
+        os.makedirs(state_dir, exist_ok=True)
+        row = {"id": "evt-1", "ts": 1_800_000_000.0, "kind": "training_finished",
+               "character_id": ADA.character_id, "character_name": self.NAME,
+               "skill_id": SKILL_NAV, "skill_name": "Navigation", "finished_level": 5}
+        with open(os.path.join(state_dir, "events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    def run_cli(self, *args: str, io_encoding: str | None = None):
+        env = {**os.environ, "PYTHONPATH": REPO_ROOT, "XDG_STATE_HOME": self.state_home,
+               "XDG_CONFIG_HOME": os.path.join(self.tmp.name, "config")}
+        for var in ("PYTHONUTF8", "PYTHONCOERCECLOCALE", "PYTHONIOENCODING"):
+            env.pop(var, None)       # the child answers for its own default encoding
+        if io_encoding:
+            env["PYTHONIOENCODING"] = io_encoding
+        return subprocess.run([sys.executable, "-m", "newedenworks", *args], env=env,
+                              capture_output=True, timeout=120)
+
+    def test_a_name_outside_the_console_code_page_still_prints(self):
+        proc = self.run_cli("events", io_encoding="cp1252")
+        self.assertEqual(0, proc.returncode, proc.stderr.decode("utf-8", "replace"))
+        # Decodes as UTF-8 and still names the character: no crash, no lossy replacement.
+        self.assertIn(self.NAME, proc.stdout.decode("utf-8"))
+        self.assertNotIn("\ufffd", proc.stdout.decode("utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class CanBuildPersonalSiteTests(CommandTestCase):
+    """A personal site: stock another site character holds in the facility counts as a trade."""
+
+    def test_jobs_with_trades_from_another_character(self):
+        from newedenworks import sso as sso_mod
+        from tests.fake_esi import BUILD_CELL, BUILD_HOUSING, BUILD_PASTE, BUILD_PLATE, STATION_JITA
+        self.env.install_can_build()
+        everything = sso_mod.SCOPES + sso_mod.scopes_for(["all"])
+        self.env.write_tokens([self.env.token_for(ADA, everything), self.env.token_for(VELA, everything)])
+        copies = [{"item_id": 930201, "type_id": 930001, "location_id": STATION_JITA, "location_flag": "Hangar",
+                   "quantity": -2, "runs": 10, "material_efficiency": 7, "time_efficiency": 14},
+                  {"item_id": 930202, "type_id": 930001, "location_id": STATION_JITA, "location_flag": "Hangar",
+                   "quantity": -2, "runs": 10, "material_efficiency": 7, "time_efficiency": 14}]
+        def stock(items):
+            return [{"item_id": 950000 + i, "type_id": t, "quantity": q, "is_singleton": False,
+                     "location_id": STATION_JITA, "location_flag": "Hangar", "location_type": "station"}
+                    for i, (t, q) in enumerate(items)]
+        server = self.env.server
+        server.get(f"/characters/{ADA.character_id}/blueprints", token=ADA.token, doc=copies)
+        server.get(f"/characters/{VELA.character_id}/blueprints", token=VELA.token, doc=[])
+        server.get(f"/characters/{ADA.character_id}/assets", token=ADA.token,
+                   doc=stock([(BUILD_PLATE, 38), (BUILD_HOUSING, 500), (BUILD_CELL, 100), (BUILD_PASTE, 100)]))
+        server.get(f"/characters/{VELA.character_id}/assets", token=VELA.token, doc=stock([(BUILD_PLATE, 60)]))
+        for who in (ADA, VELA):
+            server.get(f"/characters/{who.character_id}/industry/jobs", token=who.token, doc=[])
+        # The same answer when the site invents elsewhere and builds where the stock is.
+        plain = {"owner": "personal", "facility": "jita", "characters": [ADA.name, VELA.name]}
+        split = dict(plain, facility="lab", facilities={"manufacturing": "jita"})
+        for site in (plain, split):
+            with self.subTest(site=site):
+                with open(os.path.join(self.env.config_home, "eve-skills", "operation.json"), "w") as fh:
+                    json.dump({"sites": {"home": site},
+                               "facilities": {"jita": {"location_id": STATION_JITA},
+                                              "lab": {"location_id": 1_040_000_000_000, "tax_pct": 1}}}, fh)
+                code, out, err = self.env.run(["can-build", "--site", "home", "--json"])
+                self.assertEqual(code, 0, err)
+                doc = json.loads(out)
+                row = next(d for d in doc["documents"] if d["owner"] == ADA.name)["rows"][0]
+                self.assertEqual((1, 2), (row["jobs"], row["jobs_with_trades"]))
+                self.assertEqual([("Widget Plate", 38, VELA.name)],
+                                 [(t["material"], t["quantity"], t["from"]) for t in row["trades"]])
+
+
+class CanBuildFacilityBonusTests(CommandTestCase):
+    """Without --site, a blueprint sitting in a configured facility gets that facility's material bonus."""
+
+    def run_jobs(self, facilities):
+        from newedenworks import sso as sso_mod
+        from tests.fake_esi import BUILD_CELL, BUILD_HOUSING, BUILD_PASTE, BUILD_PLATE, STATION_JITA
+        self.env.install_can_build()
+        self.env.write_tokens([self.env.token_for(ADA, sso_mod.SCOPES + sso_mod.scopes_for(["all"]))])
+        copies = [{"item_id": 930200 + i, "type_id": 930001, "location_id": STATION_JITA, "location_flag": "Hangar",
+                   "quantity": -2, "runs": 10, "material_efficiency": 7, "time_efficiency": 14} for i in range(4)]
+        stock = [{"item_id": 950000 + i, "type_id": t, "quantity": q, "is_singleton": False,
+                  "location_id": STATION_JITA, "location_flag": "Hangar", "location_type": "station"}
+                 for i, (t, q) in enumerate([(BUILD_PLATE, 76), (BUILD_HOUSING, 5000), (BUILD_CELL, 1000),
+                                             (BUILD_PASTE, 1000)])]
+        server = self.env.server
+        server.get(f"/characters/{ADA.character_id}/blueprints", token=ADA.token, doc=copies)
+        server.get(f"/characters/{ADA.character_id}/assets", token=ADA.token, doc=stock)
+        server.get(f"/characters/{ADA.character_id}/industry/jobs", token=ADA.token, doc=[])
+        with open(os.path.join(self.env.config_home, "eve-skills", "operation.json"), "w") as fh:
+            json.dump({"facilities": facilities}, fh)
+        code, out, err = self.env.run(["can-build", "--char", "Ada", "--json"])
+        self.assertEqual(code, 0, err)
+        return json.loads(out)["documents"][0]["rows"][0]["jobs"]
+
+    def test_bonus_of_the_facility_the_blueprint_sits_in(self):
+        from tests.fake_esi import STATION_JITA
+        elsewhere = self.run_jobs({"lab": {"location_id": 1_040_000_000_000, "material": {"manufacturing": 0.5}}})
+        here = self.run_jobs({"lab": {"location_id": STATION_JITA, "material": {"manufacturing": 0.5}}})
+        self.assertEqual(2, elsewhere)
+        self.assertGreater(here, elsewhere)
