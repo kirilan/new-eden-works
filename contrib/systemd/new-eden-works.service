@@ -1,4 +1,4 @@
-# New Eden Works service: every enabled plugin's scheduled jobs in one process (see README, `service`).
+# New Eden Works service: every enabled plugin's scheduled jobs in one process (see docs/automation.md, `service`).
 # It replaces eve-orders-alert.timer and eve-prices.timer, and eve-dashboard.service once config.json has
 # "service": {"jobs": {"dashboard": true}} and a "dashboard" section. Install:
 #   cp contrib/systemd/new-eden-works.service ~/.config/systemd/user/
