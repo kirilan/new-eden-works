@@ -171,8 +171,8 @@ rm -rf "$T"
 The same pass on Windows, where three details of that block do not transfer. The venv's script
 directory is `Scripts`, not `bin`; the console entry point is a real `neworks.exe`; and there is no
 `HOME=… XDG_*=… command` prefix form — the variables have to be set in the session first, which works
-because `$XDG_*` pins are honoured on Windows too (see [README — The four
-roots](README.md#the-four-roots)), so this run still tests a throwaway tree rather than the real profile:
+because `$XDG_*` pins are honoured on Windows too (see [The four
+roots](docs/data-and-security.md#the-four-roots)), so this run still tests a throwaway tree rather than the real profile:
 
 ```powershell
 $V = "0.2.0"
