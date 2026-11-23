@@ -127,6 +127,14 @@ scenarios are different evidence. Unknown eligibility, fees or timing need check
   structure's "Deliver to" land in the Deliveries hangar; move them to the item hangar before installing.
 - **A site with a facility per activity** invents at one facility and builds at another: copies made at
   the lab must be hauled to the build facility before they can be installed.
+- **Moving to another structure.** Check each activity's rigs against the structure's rig list, not its
+  name: a structure called "Laboratory" can carry copy and research rigs but no invention rig, and an
+  invention rig can sit on a manufacturing structure. Give each activity the facility whose rig covers it.
+  Then compare the old and new facility at the job's real size (`build-cost --facility OLD` and
+  `--facility NEW` with the planned `--runs` and `--me`). Materials are rounded up per job, so a better
+  material rig can save nothing on 10-run ME0 jobs and only pay on large, few-run lines. Time bonuses
+  apply in full, so a hull with a smaller role bonus (Raitaru -15% vs Sotiyo -30%) lengthens every job:
+  re-size runs to the finish windows instead of reusing the old counts.
 
 ## 3. Reading the data
 
@@ -142,6 +150,9 @@ scenarios are different evidence. Unknown eligibility, fees or timing need check
 - **Which decryptor did a running job use?** The job's success probability (ledger `jobs` table) is the
   base chance times the decryptor's chance factor.
 - Times converted from another facility (`~`) are estimates: re-measure after the first jobs there.
+- **Right after a move** the asset snapshot can still show the stock at the old structure, so the board
+  says blueprint rows are "held away from this site's facilities" and lists no copies. Wait for the assets
+  refresh (the board prints its age) instead of planning from the old location.
 - Out of scope: reactions and planetary industry (`neworks pi`, `neworks colonies`).
 
 ## 4. Reply format
