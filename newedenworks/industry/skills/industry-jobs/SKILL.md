@@ -120,6 +120,9 @@ scenarios are different evidence. Unknown eligibility, fees or timing need check
   `skills`), never from notes.
 - **Materials.** A `buy` line in the pool check means the job is blocked: cut that line's jobs to what
   the stock covers and say what to buy (hand over to the supply-run skill).
+  A `full` line is not always on site: stock a character holds at a trade hub counts as `pick up`. The
+  job is covered where it is installed only when its materials show `pick up` 0; otherwise it waits for
+  that haul.
 - **Stock passing** (choice): a corp site shares hangars (set each job's Input Material Location to the
   division that holds the inputs); a personal site needs the blueprint and every input in the
   **installer's own item hangar**, either handed to each builder or held by one pool holder
